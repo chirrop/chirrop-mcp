@@ -1,0 +1,50 @@
+{
+  "name": "@chirropjs/chirrop-mcp",
+  "version": "0.2.0",
+  "description": "MCP server for the ChirrOp monitoring platform",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "chirrop-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@chirropjs/chirrop": "^0.1.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "chirrop",
+    "mcp",
+    "model-context-protocol",
+    "monitoring",
+    "analytics"
+  ],
+  "license": "MIT",
+  "author": "ChirrOp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chirrop/chirrop-mcp"
+  }
+}

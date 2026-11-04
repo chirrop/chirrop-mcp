@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "chirrop": {
+      "command": "node",
+      "args": ["/Users/gavinwong/Dev/chirpier/chirrop-mcp/dist/index.js"],
+      "env": {
+        "CHIRROP_API_KEY": "${CHIRROP_API_KEY}"
+      }
+    }
+  }
+}
