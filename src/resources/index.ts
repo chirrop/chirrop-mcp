@@ -1,5 +1,34 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client, Alert, Event } from "@chirropjs/chirrop";
+import { isUuid } from "../refs.js";
+import { redactDestination } from "../tools/destinations.js";
+
+const ROLLUP_PERIODS = ["minute", "hour", "day"] as const;
+const ALERT_STATUSES = ["triggered", "acknowledged", "resolved", "archived"] as const;
+const ANALYTICS_PERIODS = ["1h", "1d", "7d", "1m"] as const;
+const ANALYTICS_PREVIOUS = ["previous_window", "previous_1d", "previous_7d", "previous_1m"] as const;
+
+/**
+ * Validate a URI template variable before it reaches the SDK, which splices
+ * IDs straight into request paths (so e.g. ".." could reach other endpoints).
+ */
+function oneOf<T extends string>(name: string, value: string | string[], allowed: readonly T[]): T {
+  if (typeof value === "string" && (allowed as readonly string[]).includes(value)) return value as T;
+  throw new Error(`Invalid ${name} "${String(value)}". Must be one of: ${allowed.join(", ")}.`);
+}
+
+function eventIdParam(value: string | string[]): string {
+  if (typeof value === "string" && isUuid(value)) return value;
+  throw new Error(`Invalid event_id "${String(value)}". Must be an event UUID — call list_events to find one.`);
+}
+
+function agentParam(value: string | string[]): string {
+  try {
+    return decodeURIComponent(String(value));
+  } catch {
+    throw new Error(`Invalid agent "${String(value)}": malformed URI encoding.`);
+  }
+}
 
 export function registerResources(server: McpServer, client: Client): void {
   // Static resources
@@ -55,7 +84,7 @@ export function registerResources(server: McpServer, client: Client): void {
         {
           uri: uri.href,
           mimeType: "application/json",
-          text: JSON.stringify(await client.listDestinations(), null, 2),
+          text: JSON.stringify((await client.listDestinations()).map(redactDestination), null, 2),
         },
       ],
     })
@@ -112,7 +141,7 @@ export function registerResources(server: McpServer, client: Client): void {
         })),
       }),
       complete: {
-        period: (value) => ["minute", "hour", "day"].filter((p) => p.startsWith(value)),
+        period: (value) => ROLLUP_PERIODS.filter((p) => p.startsWith(value)),
         event_id: async (value) =>
           (await client.listEvents())
             .map((e) => e.event_id)
@@ -131,7 +160,7 @@ export function registerResources(server: McpServer, client: Client): void {
           uri: uri.href,
           mimeType: "application/json",
           text: JSON.stringify(
-            await client.getEventLogs(event_id as string, { period: period as "minute" | "hour" | "day" }),
+            await client.getEventLogs(eventIdParam(event_id), { period: oneOf("period", period, ROLLUP_PERIODS) }),
             null,
             2
           ),
@@ -144,7 +173,7 @@ export function registerResources(server: McpServer, client: Client): void {
     "alerts-by-status",
     new ResourceTemplate("chirrop://alerts/{status}", {
       list: async () => ({
-        resources: (["triggered", "acknowledged", "resolved", "archived"] as const).map(
+        resources: ALERT_STATUSES.map(
           (s) => ({
             uri: `chirrop://alerts/${s}`,
             name: `${s} alerts`,
@@ -154,9 +183,7 @@ export function registerResources(server: McpServer, client: Client): void {
       }),
       complete: {
         status: (value) =>
-          ["triggered", "acknowledged", "resolved", "archived"].filter((s) =>
-            s.startsWith(value)
-          ),
+          ALERT_STATUSES.filter((s) => s.startsWith(value)),
       },
     }),
     {
@@ -170,7 +197,7 @@ export function registerResources(server: McpServer, client: Client): void {
           uri: uri.href,
           mimeType: "application/json",
           text: JSON.stringify(
-            await client.listAlerts(status as "triggered" | "acknowledged" | "resolved" | "archived"),
+            await client.listAlerts(oneOf("status", status, ALERT_STATUSES)),
             null,
             2
           ),
@@ -190,11 +217,9 @@ export function registerResources(server: McpServer, client: Client): void {
         })),
       }),
       complete: {
-        period: (value) => ["1h", "1d", "7d", "1m"].filter((p) => p.startsWith(value)),
+        period: (value) => ANALYTICS_PERIODS.filter((p) => p.startsWith(value)),
         previous: (value) =>
-          ["previous_window", "previous_1d", "previous_7d", "previous_1m"].filter((p) =>
-            p.startsWith(value)
-          ),
+          ANALYTICS_PREVIOUS.filter((p) => p.startsWith(value)),
         event_id: async (value) =>
           (await client.listEvents())
             .map((e) => e.event_id)
@@ -214,10 +239,10 @@ export function registerResources(server: McpServer, client: Client): void {
           uri: uri.href,
           mimeType: "application/json",
           text: JSON.stringify(
-            await client.getEventAnalytics(event_id as string, {
+            await client.getEventAnalytics(eventIdParam(event_id), {
               view: "window",
-              period: period as "1h" | "1d" | "7d" | "1m",
-              previous: previous as "previous_window" | "previous_1d" | "previous_7d" | "previous_1m",
+              period: oneOf("period", period, ANALYTICS_PERIODS),
+              previous: oneOf("previous", previous, ANALYTICS_PREVIOUS),
             }),
             null,
             2
@@ -256,15 +281,16 @@ export function registerResources(server: McpServer, client: Client): void {
       mimeType: "application/json",
     },
     async (uri, { agent }) => {
+      const agentName = agentParam(agent);
       const events = await client.listEvents() as unknown as Event[];
-      const agentEvents = events.filter((e) => e.agent === decodeURIComponent(agent as string));
+      const agentEvents = events.filter((e) => e.agent === agentName);
       return {
         contents: [
           {
             uri: uri.href,
             mimeType: "application/json",
             text: JSON.stringify({
-              agent: decodeURIComponent(agent as string),
+              agent: agentName,
               event_count: agentEvents.length,
               events: agentEvents,
             }, null, 2),

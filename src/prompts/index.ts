@@ -32,7 +32,7 @@ export function registerPrompts(server: McpServer): void {
               `1. **Create the event** definition using create_event with name "${event_name}"${unit ? `, unit "${unit}"` : ""}${agent ? `, agent "${agent}"` : ""}.`,
               "2. **Send a test log** using send_logs to confirm the event is working.",
               "3. **Create a policy** using create_policy. Ask me what aggregate function (sum, count, average, min, max, p95_est, p99_est), condition (gt, lt, eq, gte, lte), threshold, period (minute, hour, day), and severity (info, warning, error, critical) I want.",
-              "4. **Create a destination** using create_destination. Ask me what channel (email, webhook, slack, telegram, discord) and configuration I want to use. If a URL or credential is a secret, suggest I set it as an environment variable on the MCP server and pass it as 'env:VAR_NAME' instead of pasting it here.",
+              "4. **Create a destination** using create_destination. Ask me what channel (email, webhook, slack, telegram, discord) and configuration I want to use. If a URL or credential is a secret, suggest I set it as a CHIRROP_SECRET_-prefixed environment variable on the MCP server and pass it as 'env:CHIRROP_SECRET_<NAME>' instead of pasting it here.",
               "5. **Test the destination** using test_destination, then check delivery status with get_alert_deliveries using kind='test'.",
               "",
               "Start with step 1 and confirm each step before moving on.",

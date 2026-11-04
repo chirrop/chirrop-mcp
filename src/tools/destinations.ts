@@ -5,13 +5,27 @@ import { formatError } from "../errors.js";
 
 const DESTINATION_NOT_FOUND_HINT = "Call list_destinations to see valid destination IDs.";
 
+// Only variables with this prefix may be referenced, so an env: reference
+// can't be used to exfiltrate CHIRROP_API_KEY or other server secrets.
+export const SECRET_ENV_PREFIX = "CHIRROP_SECRET_";
+
 const ENV_REF_DESCRIPTION =
-  "String values may be given as 'env:VAR_NAME' to read the real value from the MCP server's environment, " +
-  "keeping secrets out of the conversation.";
+  `String values may be given as 'env:${SECRET_ENV_PREFIX}<NAME>' to read the real value from the MCP server's environment, ` +
+  `keeping secrets out of the conversation. Only variables prefixed ${SECRET_ENV_PREFIX} can be referenced.`;
+
+// Credential keys that identify a recipient rather than authenticate, so they stay visible.
+const NON_SECRET_CREDENTIAL_KEYS = new Set(["address", "chat_id"]);
+const REDACTED = "[redacted]";
 
 function resolveSecret(value: string): string {
   if (!value.startsWith("env:")) return value;
   const name = value.slice(4);
+  if (!name.startsWith(SECRET_ENV_PREFIX)) {
+    throw new Error(
+      `Environment variable "${name}" cannot be referenced: only variables prefixed ${SECRET_ENV_PREFIX} are allowed. ` +
+        `Expose the secret to the MCP server as ${SECRET_ENV_PREFIX}<NAME> and pass "env:${SECRET_ENV_PREFIX}<NAME>".`
+    );
+  }
   const resolved = process.env[name];
   if (!resolved) {
     throw new Error(
@@ -32,6 +46,31 @@ function resolveCredentials(
       typeof value === "string" ? resolveSecret(value) : value,
     ])
   );
+}
+
+function redactUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return parsed.pathname === "/" && !parsed.search ? parsed.origin : `${parsed.origin}/${REDACTED}`;
+  } catch {
+    return REDACTED;
+  }
+}
+
+/** Mask webhook URL paths and credential values so resolved secrets never reach the conversation. */
+export function redactDestination<T>(destination: T): T {
+  if (!destination || typeof destination !== "object") return destination;
+  const d = { ...(destination as Record<string, unknown>) };
+  if (typeof d.url === "string") d.url = redactUrl(d.url);
+  if (d.credentials && typeof d.credentials === "object") {
+    d.credentials = Object.fromEntries(
+      Object.entries(d.credentials as Record<string, unknown>).map(([key, value]) => [
+        key,
+        NON_SECRET_CREDENTIAL_KEYS.has(key) ? value : REDACTED,
+      ])
+    );
+  }
+  return d as T;
 }
 
 export function registerDestinationTools(
@@ -56,7 +95,7 @@ export function registerDestinationTools(
       let destinations = await client.listDestinations();
       if (channel) destinations = destinations.filter((d) => d.channel === channel);
       if (enabled !== undefined) destinations = destinations.filter((d) => d.enabled === enabled);
-      return { content: [{ type: "text" as const, text: JSON.stringify(destinations) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(destinations.map(redactDestination)) }] };
     } catch (error) {
       return { content: [{ type: "text" as const, text: formatError("list destinations", error) }], isError: true };
     }
@@ -77,7 +116,7 @@ export function registerDestinationTools(
   }, async ({ destination_id }) => {
     try {
       const destination = await client.getDestination(destination_id);
-      return { content: [{ type: "text" as const, text: JSON.stringify(destination, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(redactDestination(destination), null, 2) }] };
     } catch (error) {
       return { content: [{ type: "text" as const, text: formatError("get destination", error, DESTINATION_NOT_FOUND_HINT) }], isError: true };
     }
@@ -90,7 +129,8 @@ export function registerDestinationTools(
       "Always call test_destination after creation to verify delivery works. " +
       "Channel types: 'slack' (requires url), 'discord' (requires url), 'webhook' (requires url), " +
       "'telegram' (requires credentials.bot_token and credentials.chat_id), 'email' (requires credentials.address). " +
-      "Prefer 'env:VAR_NAME' references for url and credential values so secrets stay out of the conversation. " +
+      `Prefer 'env:${SECRET_ENV_PREFIX}<NAME>' references for url and credential values so secrets stay out of the conversation; ` +
+      "returned URLs and credentials are redacted. " +
       "Destinations cannot be deleted; to retire one, set enabled=false via update_destination.",
     inputSchema: {
       channel: z
@@ -111,10 +151,10 @@ export function registerDestinationTools(
         ),
       scope: z
         .string()
-        .describe("'all' routes every alert. Any other value routes only alerts from policies listed in policy_ids."),
+        .describe("'all' routes every alert; 'policies' routes only alerts from the policies listed in policy_ids."),
       policy_ids: z
-        .array(z.string())
-        .describe("Policy UUIDs to route to this destination. Pass empty array when scope is 'all'."),
+        .array(z.string().uuid("Each policy_id must be a valid UUID."))
+        .describe("Policy UUIDs to route to this destination when scope is 'policies'. Pass an empty array when scope is 'all'."),
       enabled: z.boolean().describe("Whether this destination is active."),
     },
     annotations: {
@@ -130,7 +170,7 @@ export function registerDestinationTools(
         url: url !== undefined ? resolveSecret(url) : undefined,
         credentials: resolveCredentials(credentials),
       });
-      return { content: [{ type: "text" as const, text: JSON.stringify(destination, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(redactDestination(destination), null, 2) }] };
     } catch (error) {
       return { content: [{ type: "text" as const, text: formatError("create destination", error) }], isError: true };
     }
@@ -145,16 +185,16 @@ export function registerDestinationTools(
     inputSchema: {
       destination_id: z.string().uuid("Must be a valid UUID.").describe("The destination UUID to update."),
       channel: z.enum(["email", "webhook", "slack", "telegram", "discord"]).optional().describe("Updated channel type."),
-      url: z.string().optional().describe("Updated webhook/Slack/Discord URL. Accepts 'env:VAR_NAME' references."),
-      credentials: z.record(z.unknown()).optional().describe("Updated credentials. String values accept 'env:VAR_NAME' references."),
-      scope: z.string().optional().describe("Updated scope."),
-      policy_ids: z.array(z.string()).optional().describe("Updated policy UUIDs."),
+      url: z.string().optional().describe(`Updated webhook/Slack/Discord URL. Accepts 'env:${SECRET_ENV_PREFIX}<NAME>' references.`),
+      credentials: z.record(z.unknown()).optional().describe(`Updated credentials. String values accept 'env:${SECRET_ENV_PREFIX}<NAME>' references.`),
+      scope: z.string().optional().describe("Updated scope: 'all' or 'policies'."),
+      policy_ids: z.array(z.string().uuid("Each policy_id must be a valid UUID.")).optional().describe("Updated policy UUIDs (used when scope is 'policies')."),
       enabled: z.boolean().optional().describe("Updated enabled state. Set false to retire the destination (there is no delete)."),
     },
     annotations: {
       title: "Update Destination",
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: true,
     },
   }, async ({ destination_id, url, credentials, ...payload }) => {
@@ -164,7 +204,7 @@ export function registerDestinationTools(
         ...(url !== undefined ? { url: resolveSecret(url) } : {}),
         ...(credentials !== undefined ? { credentials: resolveCredentials(credentials) } : {}),
       });
-      return { content: [{ type: "text" as const, text: JSON.stringify(destination, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(redactDestination(destination), null, 2) }] };
     } catch (error) {
       return { content: [{ type: "text" as const, text: formatError("update destination", error, DESTINATION_NOT_FOUND_HINT) }], isError: true };
     }

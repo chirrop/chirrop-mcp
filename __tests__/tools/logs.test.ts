@@ -43,9 +43,27 @@ describe("registerLogTools", () => {
       expect(structured.sent).toBe(2);
       expect(structured.failed).toBe(0);
       expect(structured.results).toEqual([
-        { index: 0, event: "test.count", ok: true },
-        { index: 1, event: "test.count", ok: true },
+        { index: 0, log_id: expect.any(String), event: "test.count", ok: true },
+        { index: 1, log_id: expect.any(String), event: "test.count", ok: true },
       ]);
+    });
+
+    it("assigns log_ids up front, keeps caller-supplied ones, and returns them for retry", async () => {
+      const handler = handlers.get("send_logs")!;
+      client.flush.mockRejectedValueOnce(new Error("socket hang up"));
+      const supplied = "0b6f5a3e-4c1d-4f7a-9e2b-8a1c2d3e4f50";
+
+      const result = await handler({
+        logs: [{ event: "a.count", value: 1, log_id: supplied }, { event: "b.count", value: 2 }],
+      }) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBe(true);
+      const { results } = JSON.parse(result.content[1].text);
+      expect(results[0].log_id).toBe(supplied);
+      expect(results[1].log_id).toMatch(/^[0-9a-f-]{36}$/);
+      // the IDs reported are the ones actually sent to the SDK
+      expect(client.log.mock.calls.map((c: unknown[]) => (c[0] as { log_id: string }).log_id))
+        .toEqual([supplied, results[1].log_id]);
     });
 
     it("reports partial failures", async () => {
@@ -67,7 +85,7 @@ describe("registerLogTools", () => {
       const structured = JSON.parse(result.content[1].text);
       expect(structured.sent).toBe(1);
       expect(structured.failed).toBe(1);
-      expect(structured.results[1]).toEqual({ index: 1, event: "bad.event", ok: false, error: "bad event" });
+      expect(structured.results[1]).toEqual({ index: 1, log_id: expect.any(String), event: "bad.event", ok: false, error: "bad event" });
     });
 
     it("returns isError when all logs fail", async () => {

@@ -26,6 +26,31 @@ export function computeGlobalStats(means: number[]): BucketStats {
   return { mean, stddev: Math.sqrt(variance), variance };
 }
 
+export interface BucketPoint {
+  count: number;
+  value: number;
+  squares: number;
+}
+
+/**
+ * Per-bucket means plus global stats over the non-empty buckets only. Empty
+ * buckets (count 0) would otherwise count as a mean of 0, dragging the
+ * baseline down and showing up as false "drop" anomalies.
+ */
+export function analyzeBuckets(points: BucketPoint[]): {
+  bucketMeans: number[];
+  globalStats: BucketStats;
+  deviationSigma: (i: number) => number;
+} {
+  const bucketMeans = points.map((p) => computeBucketStats(p.count, p.value, p.squares).mean);
+  const globalStats = computeGlobalStats(bucketMeans.filter((_, i) => points[i]!.count > 0));
+  const deviationSigma = (i: number) =>
+    points[i]!.count > 0 && globalStats.stddev > 0
+      ? Math.abs(bucketMeans[i]! - globalStats.mean) / globalStats.stddev
+      : 0;
+  return { bucketMeans, globalStats, deviationSigma };
+}
+
 export type TrendDirection = "up" | "down" | "stable";
 
 export function computeTrend(current: number, previous: number): TrendDirection {

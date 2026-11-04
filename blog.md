@@ -211,7 +211,7 @@ await client.log({
 
 **3. Use the investigate-stream prompt.** When something looks off, this guided prompt runs health check → anomaly scan → analytics trend → policy review → recommendation in sequence, without needing to manually chain five tool calls.
 
-**4. Let OpenClaw close the loop.** With `CHIRROP_POLL_ALERTS=true`, the MCP server polls for new triggered alerts and emits MCP notifications, which OpenClaw can pick up and push to the user via Telegram, Slack, or whichever messaging platform they prefer.
+**4. Close the loop.** Create a destination (Telegram, Slack, Discord, email or webhook) so triggered alerts reach you, keeping its webhook URL or bot token in a `CHIRROP_SECRET_` environment variable rather than in the chat. When an alert arrives, the `triage-alert` prompt walks Claude through alert details → rollups → analytics → delivery status → acknowledge/resolve/archive.
 
 ---
 
@@ -246,11 +246,13 @@ Add to your Claude Code MCP config:
       "command": "npx",
       "args": ["-y", "@chirropjs/chirrop-mcp"],
       "env": {
-        "CHIRROP_API_KEY": "your-key-here"
+        "CHIRROP_API_KEY": "chp_your_api_key"
       }
     }
   }
 }
 ```
+
+`CHIRROP_API_KEY` must start with `chp_`. To route alerts to Slack, Telegram or a webhook without pasting secrets into the chat, add them to the same `env` block as `CHIRROP_SECRET_<NAME>` variables and reference them as `env:CHIRROP_SECRET_<NAME>`. The README covers the details.
 
 For OpenClaw, use `openclaw.{skill-name}` as the `agent` value when calling `send_logs`. Then `get_agent_summary(agent: "openclaw.{skill-name}")` gives you the full picture on demand.

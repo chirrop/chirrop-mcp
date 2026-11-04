@@ -11,11 +11,16 @@ import { registerAlertTools } from "./tools/alerts.js";
 import { registerDestinationTools } from "./tools/destinations.js";
 import { registerResources } from "./resources/index.js";
 import { registerPrompts } from "./prompts/index.js";
+import { readFileSync } from "node:fs";
+
+const { version } = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8")
+) as { version: string };
 
 const server = new McpServer(
   {
     name: "chirrop-mcp",
-    version: "0.2.0",
+    version,
   },
   {
     instructions: [
@@ -31,7 +36,7 @@ const server = new McpServer(
       "The ChirrOp API has no delete operations. To retire a policy or destination, set enabled=false via update_policy / update_destination. Event definitions cannot be removed.",
       "",
       "## Secrets",
-      "Destination url and credential values accept 'env:VAR_NAME' references, resolved from the server's environment — prefer these over pasting secrets into the conversation.",
+      "Destination url and credential values accept 'env:CHIRROP_SECRET_<NAME>' references (only CHIRROP_SECRET_-prefixed variables), resolved from the server's environment — prefer these over pasting secrets into the conversation. Returned URLs and credentials are redacted.",
       "",
       "## Period types (do not mix these up)",
       "- Rollup periods: minute, hour, day — used in get_event_rollups and policy evaluation (create_policy, update_policy).",

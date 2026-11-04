@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { computeBucketStats, computeGlobalStats, computeTrend, classifyPctChange } from "../src/stats.js";
+import { analyzeBuckets, computeBucketStats, computeGlobalStats, computeTrend, classifyPctChange } from "../src/stats.js";
 
 describe("computeBucketStats", () => {
   it("returns zeros for zero count", () => {
@@ -99,5 +99,24 @@ describe("classifyPctChange", () => {
   it("respects custom thresholds", () => {
     expect(classifyPctChange(5, 3, 10)).toBe("moderate_increase");
     expect(classifyPctChange(12, 3, 10)).toBe("significant_increase");
+  });
+});
+
+describe("analyzeBuckets", () => {
+  // 20 steady buckets with mean ~10, a run of empty buckets, and one real spike
+  const steady = Array.from({ length: 20 }, (_, i) => ({ count: 10, value: 100 + (i % 3), squares: 1000 }));
+  const empty = Array.from({ length: 5 }, () => ({ count: 0, value: 0, squares: 0 }));
+  const spike = { count: 10, value: 400, squares: 16000 };
+
+  it("excludes empty buckets from the baseline", () => {
+    const { globalStats } = analyzeBuckets([...steady, ...empty]);
+    expect(globalStats.mean).toBeCloseTo(10.1, 1);
+  });
+
+  it("never flags an empty bucket as an anomaly, but still flags a real spike", () => {
+    const points = [...steady, ...empty, spike];
+    const { deviationSigma } = analyzeBuckets(points);
+    for (let i = 20; i < 25; i++) expect(deviationSigma(i)).toBe(0);
+    expect(deviationSigma(25)).toBeGreaterThan(2);
   });
 });

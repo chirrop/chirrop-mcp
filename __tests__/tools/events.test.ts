@@ -284,6 +284,34 @@ describe("registerEventTools", () => {
       expect(parsed.policy_proximity[0].approaching_threshold).toBe(true);
     });
 
+    it("evaluates each policy against a bucket of its own period", async () => {
+      const recentOccurredAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      const buckets: Record<string, unknown[]> = {
+        hour: [{ occurred_at: recentOccurredAt, count: 60, value: 600, squares: 6000 }],
+        minute: [{ occurred_at: recentOccurredAt, count: 1, value: 10, squares: 100 }],
+        day: [{ occurred_at: recentOccurredAt, count: 1440, value: 14400, squares: 144000 }],
+      };
+      client.getEventLogs.mockImplementation(async (_id: string, opts: { period: string }) => buckets[opts.period]);
+      client.listAlerts.mockResolvedValue([]);
+      client.listPolicies.mockResolvedValue([
+        { policy_id: "pm", event_id: "e1", title: "Per minute", aggregate: "sum", condition: "gt", threshold: 100, period: "minute" },
+        { policy_id: "ph", event_id: "e1", title: "Per hour", aggregate: "sum", condition: "gt", threshold: 700, period: "hour" },
+        { policy_id: "pd", event_id: "e1", title: "Per day", aggregate: "sum", condition: "gt", threshold: 15000, period: "day" },
+      ]);
+
+      const result = await handlers.get("get_stream_health")!({ event_id: "e1" }) as { content: Array<{ text: string }> };
+      const byId = Object.fromEntries(
+        JSON.parse(result.content[0].text).policy_proximity.map((p: { policy_id: string }) => [p.policy_id, p])
+      );
+
+      // Before the fix the minute policy saw the hourly sum (600 vs 100 → falsely approaching)
+      expect(byId.pm).toMatchObject({ period: "minute", last_bucket_value: 10, approaching_threshold: false });
+      expect(byId.ph).toMatchObject({ period: "hour", last_bucket_value: 600, approaching_threshold: true });
+      expect(byId.pd).toMatchObject({ period: "day", last_bucket_value: 14400, approaching_threshold: true });
+      // hour bucket is reused, minute and day fetched once each
+      expect(client.getEventLogs).toHaveBeenCalledTimes(3);
+    });
+
     it("returns isError on failure", async () => {
       client.getEventLogs.mockRejectedValue(new Error("server error"));
 
@@ -339,6 +367,87 @@ describe("registerEventTools", () => {
       expect(parsed.streams[0].status).toBe("alert_active");
       expect(parsed.streams[0].active_alert_count).toBe(1);
       expect(parsed.overall_health).toBe("needs_attention");
+    });
+
+    it("uses each policy's own period when flagging approaching thresholds", async () => {
+      const recentAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      client.listEvents.mockResolvedValue([
+        { event_id: "e1", agent: "openclaw.main", event: "tool.errors.count" },
+      ]);
+      client.listAlerts.mockResolvedValue([]);
+      client.listPolicies.mockResolvedValue([
+        { policy_id: "pm", event_id: "e1", title: "Per minute", aggregate: "sum", condition: "gt", threshold: 100, period: "minute" },
+      ]);
+      client.getEventLogs.mockImplementation(async (_id: string, opts: { period: string }) =>
+        opts.period === "minute"
+          ? [{ occurred_at: recentAt, count: 1, value: 10, squares: 100 }]
+          : [{ occurred_at: recentAt, count: 60, value: 600, squares: 6000 }]
+      );
+
+      const result = await handlers.get("get_agent_summary")!({ agent: "openclaw.main" }) as { content: Array<{ text: string }> };
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(parsed.streams[0].approaching_threshold).toBe(false);
+      expect(parsed.streams[0].status).toBe("healthy");
+    });
+
+    it("reports a per-stream fetch error instead of marking it stale", async () => {
+      const recentAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      client.listEvents.mockResolvedValue([
+        { event_id: "e1", agent: "openclaw.main", event: "a.count" },
+        { event_id: "e2", agent: "openclaw.main", event: "b.count" },
+      ]);
+      client.listAlerts.mockResolvedValue([]);
+      client.listPolicies.mockResolvedValue([]);
+      client.getEventLogs.mockImplementation(async (id: string) => {
+        if (id === "e2") throw Object.assign(new Error("Too Many Requests"), { status: 429 });
+        return [{ occurred_at: recentAt, count: 5, value: 50, squares: 510 }];
+      });
+
+      const result = await handlers.get("get_agent_summary")!({ agent: "openclaw.main" }) as { content: Array<{ text: string }>; isError?: boolean };
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(result.isError).toBeUndefined();
+      expect(parsed.streams[0].status).toBe("healthy");
+      expect(parsed.streams[1].status).toBe("error");
+      expect(parsed.streams[1].error).toContain("Rate limited");
+      expect(parsed.overall_health).toBe("needs_attention");
+    });
+
+    it("returns a tool error when every stream fetch fails (e.g. bad key)", async () => {
+      client.listEvents.mockResolvedValue([
+        { event_id: "e1", agent: "openclaw.main", event: "a.count" },
+        { event_id: "e2", agent: "openclaw.main", event: "b.count" },
+      ]);
+      client.listAlerts.mockResolvedValue([]);
+      client.listPolicies.mockResolvedValue([]);
+      client.getEventLogs.mockRejectedValue(Object.assign(new Error("nope"), { status: 401 }));
+
+      const result = await handlers.get("get_agent_summary")!({ agent: "openclaw.main" }) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Authentication failed");
+    });
+
+    it("keeps at most 5 rollup requests in flight", async () => {
+      const recentAt = new Date().toISOString();
+      client.listEvents.mockResolvedValue(
+        Array.from({ length: 12 }, (_, i) => ({ event_id: `e${i}`, agent: "openclaw.main", event: `m${i}` }))
+      );
+      client.listAlerts.mockResolvedValue([]);
+      client.listPolicies.mockResolvedValue([]);
+      let inFlight = 0, peak = 0;
+      client.getEventLogs.mockImplementation(async () => {
+        peak = Math.max(peak, ++inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight--;
+        return [{ occurred_at: recentAt, count: 1, value: 1, squares: 1 }];
+      });
+
+      const result = await handlers.get("get_agent_summary")!({ agent: "openclaw.main" }) as { content: Array<{ text: string }> };
+
+      expect(JSON.parse(result.content[0].text).streams).toHaveLength(12);
+      expect(peak).toBeLessThanOrEqual(5);
     });
 
     it("returns empty streams message when no events match agent", async () => {

@@ -73,6 +73,20 @@ describe("registerResources", () => {
     });
   });
 
+  describe("destinations resource redaction", () => {
+    it("redacts webhook URL paths and secret credentials", async () => {
+      client.listDestinations.mockResolvedValue([
+        { destination_id: "d1", channel: "slack", url: "https://hooks.slack.com/services/T/B/SECRET", credentials: { token: "SECRET" } },
+      ]);
+      const handler = server.resource.mock.calls.find((c: unknown[]) => c[0] === "destinations")![3] as (uri: URL) => Promise<{ contents: Array<{ text: string }> }>;
+
+      const { contents } = await handler(new URL("chirrop://destinations"));
+
+      expect(contents[0].text).not.toContain("SECRET");
+      expect(JSON.parse(contents[0].text)[0].url).toBe("https://hooks.slack.com/[redacted]");
+    });
+  });
+
   describe("events-summary resource handler", () => {
     it("returns events, triggered alert count, and alerted event IDs", async () => {
       const events = [{ event_id: "e1", event: "test" }, { event_id: "e2", event: "other" }];
@@ -103,6 +117,35 @@ describe("registerResources", () => {
       await handler(new URL("chirrop://events/summary"));
 
       expect(client.listAlerts).toHaveBeenCalledWith("triggered");
+    });
+  });
+
+  describe("template parameter validation", () => {
+    type TemplateHandler = (uri: URL, params: Record<string, string>) => Promise<unknown>;
+    const handlerFor = (name: string) =>
+      server.resource.mock.calls.find((c: unknown[]) => c[0] === name)![3] as TemplateHandler;
+    const E = "11111111-1111-4111-8111-111111111111";
+
+    it("rejects non-UUID event_ids before calling the SDK", async () => {
+      await expect(handlerFor("event-rollups")(new URL("chirrop://x"), { event_id: "..", period: "hour" })).rejects.toThrow("Invalid event_id");
+      await expect(handlerFor("event-analytics")(new URL("chirrop://x"), { event_id: "../destinations", period: "1h", previous: "previous_window" })).rejects.toThrow("Invalid event_id");
+      expect(client.getEventLogs).not.toHaveBeenCalled();
+      expect(client.getEventAnalytics).not.toHaveBeenCalled();
+    });
+
+    it("rejects unknown periods, statuses and comparison windows", async () => {
+      await expect(handlerFor("event-rollups")(new URL("chirrop://x"), { event_id: E, period: "week" })).rejects.toThrow("Invalid period");
+      await expect(handlerFor("alerts-by-status")(new URL("chirrop://x"), { status: "open" })).rejects.toThrow("Invalid status");
+      await expect(handlerFor("event-analytics")(new URL("chirrop://x"), { event_id: E, period: "1h", previous: "last_year" })).rejects.toThrow("Invalid previous");
+    });
+
+    it("passes valid parameters through", async () => {
+      await handlerFor("event-rollups")(new URL("chirrop://x"), { event_id: E, period: "minute" });
+      expect(client.getEventLogs).toHaveBeenCalledWith(E, { period: "minute" });
+    });
+
+    it("reports malformed agent encoding instead of throwing URIError", async () => {
+      await expect(handlerFor("agent-events")(new URL("chirrop://x"), { agent: "bad%E0%A4%A" })).rejects.toThrow("malformed URI encoding");
     });
   });
 

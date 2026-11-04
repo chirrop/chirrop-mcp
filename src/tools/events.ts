@@ -3,30 +3,22 @@ import { Client, Event, EventLogPoint, Alert, Policy } from "@chirropjs/chirrop"
 import { z } from "zod";
 import { formatError } from "../errors.js";
 import { eventRefFields, resolveEventId } from "../refs.js";
-import { computeBucketStats, computeGlobalStats, computeTrend } from "../stats.js";
+import { analyzeBuckets, computeBucketStats, computeTrend } from "../stats.js";
 
 const EVENT_NOT_FOUND_HINT = "Call list_events to see valid event IDs.";
 
 function enrichRollups(points: EventLogPoint[], thresholdSigma: number) {
-  const bucketMeans = points.map((p) =>
-    computeBucketStats(p.count, p.value, p.squares).mean
-  );
-
-  const globalStats = computeGlobalStats(bucketMeans);
+  const { bucketMeans, globalStats, deviationSigma } = analyzeBuckets(points);
 
   const enrichedPoints = points.map((p, i) => {
     const bucketStats = computeBucketStats(p.count, p.value, p.squares);
-    const deviationSigma =
-      globalStats.stddev > 0
-        ? Math.abs(bucketStats.mean - globalStats.mean) / globalStats.stddev
-        : 0;
     const prevMean = i > 0 ? bucketMeans[i - 1]! : bucketStats.mean;
     const trendDirection = computeTrend(bucketStats.mean, prevMean);
     return {
       ...p,
       _mean: bucketStats.mean,
       _stddev: bucketStats.stddev,
-      _is_anomaly: deviationSigma > thresholdSigma,
+      _is_anomaly: deviationSigma(i) > thresholdSigma,
       _trend_direction: trendDirection,
     };
   });
@@ -48,12 +40,91 @@ function enrichRollups(points: EventLogPoint[], thresholdSigma: number) {
   };
 }
 
+type RollupPeriod = "minute" | "hour" | "day";
+const ROLLUP_PERIODS: readonly RollupPeriod[] = ["minute", "hour", "day"];
+
+/** The rollup period a policy is evaluated over; falls back to hour for unknown values. */
+function policyPeriod(policy: Policy): RollupPeriod {
+  return (ROLLUP_PERIODS as readonly string[]).includes(policy.period)
+    ? (policy.period as RollupPeriod)
+    : "hour";
+}
+
+/**
+ * Fetch the latest bucket for each period the given policies evaluate over,
+ * reusing an already-fetched hour bucket. Keyed by period.
+ */
+async function fetchLatestBuckets(
+  client: Client,
+  eventId: string,
+  policies: Policy[],
+  hourBucket: EventLogPoint | null
+): Promise<Map<RollupPeriod, EventLogPoint | null>> {
+  const buckets = new Map<RollupPeriod, EventLogPoint | null>([["hour", hourBucket]]);
+  const missing = [...new Set(policies.map(policyPeriod))].filter((p) => !buckets.has(p));
+  const fetched = await Promise.all(
+    missing.map((period) =>
+      client.getEventLogs(eventId, { period, limit: 1 })
+    )
+  );
+  missing.forEach((period, i) => {
+    buckets.set(period, (fetched[i] as unknown as EventLogPoint[])[0] ?? null);
+  });
+  return buckets;
+}
+
+/** Map over items with at most `limit` calls in flight, preserving order. */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+// Keeps get_agent_summary under the API rate limit for agents with many events.
+const AGENT_SUMMARY_CONCURRENCY = 5;
+
+/** Compare a policy's aggregate over its latest bucket against its threshold. */
+function evaluateProximity(policy: Policy, bucket: EventLogPoint | null) {
+  let lastBucketValue: number | null = null;
+  if (bucket && policy.aggregate !== "p95_est" && policy.aggregate !== "p99_est") {
+    if (policy.aggregate === "sum") lastBucketValue = bucket.value;
+    else if (policy.aggregate === "count") lastBucketValue = bucket.count;
+    else if (policy.aggregate === "average") lastBucketValue = bucket.count > 0 ? bucket.value / bucket.count : 0;
+    else if (policy.aggregate === "min") lastBucketValue = bucket.min;
+    else if (policy.aggregate === "max") lastBucketValue = bucket.max;
+  }
+
+  let proximityPct: number | null = null;
+  let approachingThreshold = false;
+  if (lastBucketValue !== null && policy.threshold > 0) {
+    proximityPct = (lastBucketValue / policy.threshold) * 100;
+    if (policy.condition === "gt" || policy.condition === "gte") {
+      approachingThreshold = proximityPct >= 80;
+    } else if (policy.condition === "lt" || policy.condition === "lte") {
+      approachingThreshold = lastBucketValue <= policy.threshold * 1.2;
+    }
+  }
+  return { lastBucketValue, proximityPct, approachingThreshold };
+}
+
 const policyProximitySchema = z.object({
   policy_id: z.string(),
   title: z.string(),
   aggregate: z.string(),
   condition: z.string(),
   threshold: z.number(),
+  period: z.enum(["minute", "hour", "day"]),
   last_bucket_value: z.number().nullable(),
   proximity_pct: z.number().nullable(),
   approaching_threshold: z.boolean(),
@@ -97,6 +168,7 @@ const agentSummaryOutputSchema = {
       active_alert_count: z.number(),
       approaching_threshold: z.boolean(),
       policy_count: z.number(),
+      error: z.string().optional(),
     })
   ),
   retrieved_at: z.string(),
@@ -258,7 +330,7 @@ export function registerEventTools(server: McpServer, client: Client): void {
     annotations: {
       title: "Update Event",
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: true,
     },
   }, async ({ event_id, event, agent, ...payload }) => {
@@ -366,35 +438,18 @@ export function registerEventTools(server: McpServer, client: Client): void {
       const eventAlerts = typedAlerts.filter((a) => a.event_id === eventId);
       const eventPolicies = typedPolicies.filter((p) => p.event_id === eventId);
 
+      const latestBuckets = await fetchLatestBuckets(client, eventId, eventPolicies, lastLog);
       const policyProximity = eventPolicies.map((policy) => {
-        let lastBucketValue: number | null = null;
-
-        if (lastLog && policy.aggregate !== "p95_est" && policy.aggregate !== "p99_est") {
-          if (policy.aggregate === "sum") lastBucketValue = lastLog.value;
-          else if (policy.aggregate === "count") lastBucketValue = lastLog.count;
-          else if (policy.aggregate === "average") lastBucketValue = lastLog.count > 0 ? lastLog.value / lastLog.count : 0;
-          else if (policy.aggregate === "min") lastBucketValue = lastLog.min;
-          else if (policy.aggregate === "max") lastBucketValue = lastLog.max;
-        }
-
-        let proximityPct: number | null = null;
-        let approachingThreshold = false;
-
-        if (lastBucketValue !== null && policy.threshold > 0) {
-          proximityPct = (lastBucketValue / policy.threshold) * 100;
-          if (policy.condition === "gt" || policy.condition === "gte") {
-            approachingThreshold = proximityPct >= 80;
-          } else if (policy.condition === "lt" || policy.condition === "lte") {
-            approachingThreshold = lastBucketValue <= policy.threshold * 1.2;
-          }
-        }
-
+        const period = policyPeriod(policy);
+        const { lastBucketValue, proximityPct, approachingThreshold } =
+          evaluateProximity(policy, latestBuckets.get(period) ?? null);
         return {
           policy_id: policy.policy_id,
           title: policy.title,
           aggregate: policy.aggregate,
           condition: policy.condition,
           threshold: policy.threshold,
+          period,
           last_bucket_value: lastBucketValue,
           proximity_pct: proximityPct,
           approaching_threshold: approachingThreshold,
@@ -438,7 +493,7 @@ export function registerEventTools(server: McpServer, client: Client): void {
     title: "Get Agent Summary",
     description:
       "Get a health overview of all event streams produced by a specific agent (e.g. an OpenClaw instance or skill). " +
-      "Returns each event's current status, recency, active alert count, and whether it is approaching any policy threshold. " +
+      "Returns each event's current status (healthy/warning/stale/alert_active/degraded, or error if its data couldn't be fetched), recency, active alert count, and whether it is approaching any policy threshold. " +
       "Useful as a single call to answer 'how is my openclaw.main agent performing right now?'",
     inputSchema: {
       agent: z.string().describe("The agent identity to filter by, e.g. 'openclaw.main' or 'openclaw.scheduler'."),
@@ -479,16 +534,35 @@ export function registerEventTools(server: McpServer, client: Client): void {
         };
       }
 
-      // Fetch the most recent hour bucket for each event concurrently
-      const recentLogs = await Promise.all(
-        agentEvents.map((e) =>
-          client.getEventLogs(e.event_id, { period: "hour", limit: 1 }).catch(() => [])
-        )
+      // Fetch the most recent hour bucket for each event, plus the latest
+      // bucket for any other period its policies evaluate over. A failed fetch
+      // is reported on that stream rather than misread as missing data.
+      const latestBuckets = await mapWithConcurrency(
+        agentEvents,
+        AGENT_SUMMARY_CONCURRENCY,
+        async (e) => {
+          try {
+            const hourLogs = await client.getEventLogs(e.event_id, { period: "hour", limit: 1 });
+            const hourBucket = (hourLogs as unknown as EventLogPoint[])[0] ?? null;
+            const policies = typedPolicies.filter((p) => p.event_id === e.event_id);
+            return { buckets: await fetchLatestBuckets(client, e.event_id, policies, hourBucket) };
+          } catch (error) {
+            return { buckets: undefined, error };
+          }
+        }
       );
 
+      // If nothing could be fetched it's an account-level problem (auth, rate
+      // limit, outage) — report it as a tool error, not as N stale streams.
+      const failure = latestBuckets.find((r) => "error" in r);
+      if (failure && latestBuckets.every((r) => "error" in r)) throw failure.error;
+
       const streams = agentEvents.map((event, i) => {
-        const logs = recentLogs[i] as unknown as EventLogPoint[];
-        const lastLog = logs[0] ?? null;
+        const fetched = latestBuckets[i]!;
+        const fetchError =
+          "error" in fetched ? formatError("fetch rollups", fetched.error, EVENT_NOT_FOUND_HINT) : null;
+        const buckets = fetched.buckets ?? new Map<RollupPeriod, EventLogPoint | null>();
+        const lastLog = buckets.get("hour") ?? null;
         const lastDataAt = lastLog?.occurred_at ?? null;
         let minutesSinceLast: number | null = null;
         let isStale = true;
@@ -501,22 +575,14 @@ export function registerEventTools(server: McpServer, client: Client): void {
         const eventAlerts = typedAlerts.filter((a) => a.event_id === event.event_id);
         const eventPolicies = typedPolicies.filter((p) => p.event_id === event.event_id);
 
-        const approachingThreshold = eventPolicies.some((policy) => {
-          if (!lastLog) return false;
-          if (policy.aggregate === "p95_est" || policy.aggregate === "p99_est") return false;
-          let lastBucketValue: number | null = null;
-          if (policy.aggregate === "sum") lastBucketValue = lastLog.value;
-          else if (policy.aggregate === "count") lastBucketValue = lastLog.count;
-          else if (policy.aggregate === "average") lastBucketValue = lastLog.count > 0 ? lastLog.value / lastLog.count : 0;
-          else if (policy.aggregate === "min") lastBucketValue = lastLog.min;
-          else if (policy.aggregate === "max") lastBucketValue = lastLog.max;
-          if (lastBucketValue === null || policy.threshold <= 0) return false;
-          const pct = (lastBucketValue / policy.threshold) * 100;
-          return (policy.condition === "gt" || policy.condition === "gte") ? pct >= 80 : lastBucketValue <= policy.threshold * 1.2;
-        });
+        const approachingThreshold = eventPolicies.some(
+          (policy) =>
+            evaluateProximity(policy, buckets.get(policyPeriod(policy)) ?? null).approachingThreshold
+        );
 
         let status: string;
-        if (isStale && eventAlerts.length > 0) status = "degraded";
+        if (fetchError) status = "error";
+        else if (isStale && eventAlerts.length > 0) status = "degraded";
         else if (eventAlerts.length > 0) status = "alert_active";
         else if (isStale) status = "stale";
         else if (approachingThreshold) status = "warning";
@@ -534,6 +600,7 @@ export function registerEventTools(server: McpServer, client: Client): void {
           active_alert_count: eventAlerts.length,
           approaching_threshold: approachingThreshold,
           policy_count: eventPolicies.length,
+          ...(fetchError ? { error: fetchError } : {}),
         };
       });
 
