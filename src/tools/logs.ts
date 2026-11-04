@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@chirropjs/chirrop";
 import { z } from "zod";
@@ -18,9 +19,10 @@ export function registerLogTools(server: McpServer, client: Client): void {
             z.object({
               log_id: z
                 .string()
+                .uuid("log_id must be a UUID")
                 .optional()
                 .describe(
-                  "UUID idempotency key. Auto-generated if omitted."
+                  "UUID idempotency key. Auto-generated if omitted; generated IDs are returned so a retry can reuse them."
                 ),
               agent: z
                 .string()
@@ -66,20 +68,22 @@ export function registerLogTools(server: McpServer, client: Client): void {
     async ({ logs }) => {
       try {
         const errors: string[] = [];
-        const results: Array<{ index: number; event: string; ok: boolean; error?: string }> = [];
+        const results: Array<{ index: number; log_id: string; event: string; ok: boolean; error?: string }> = [];
         let queued = 0;
 
         // client.log() enqueues into an internal batch; validation errors
         // surface here, network errors surface from flush() below.
-        for (const [index, entry] of logs.entries()) {
+        // Assign IDs up front so the caller can retry idempotently whatever fails.
+        for (const [index, input] of logs.entries()) {
+          const entry = { ...input, log_id: input.log_id ?? randomUUID() };
           try {
             await client.log(entry);
             queued++;
-            results.push({ index, event: entry.event, ok: true });
+            results.push({ index, log_id: entry.log_id, event: entry.event, ok: true });
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             errors.push(`Log "${entry.event}": ${message}`);
-            results.push({ index, event: entry.event, ok: false, error: message });
+            results.push({ index, log_id: entry.log_id, event: entry.event, ok: false, error: message });
           }
         }
 
@@ -97,8 +101,12 @@ export function registerLogTools(server: McpServer, client: Client): void {
                 type: "text" as const,
                 text:
                   `Queued ${queued}/${logs.length} log(s), but the flush to ChirrOp failed: ${flushError}. ` +
-                  "Delivery of the queued entries is not confirmed — retry send_logs (reuse log_id values for idempotency)." +
-                  (errors.length > 0 ? `\nPer-entry validation failures:\n${errors.join("\n")}` : ""),
+                  "Delivery of the queued entries is not confirmed — retry send_logs with the log_id values below so nothing is double-counted." +
+                  (errors.length > 0 ? `\nPer-entry failures:\n${errors.join("\n")}` : ""),
+              },
+              {
+                type: "text" as const,
+                text: JSON.stringify({ sent: 0, queued, failed: errors.length, results }),
               },
             ],
             isError: true,

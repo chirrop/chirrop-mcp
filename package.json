@@ -1,6 +1,6 @@
 {
   "name": "@chirropjs/chirrop-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for the ChirrOp monitoring platform",
   "type": "module",
   "main": "dist/index.js",
@@ -45,6 +45,6 @@
   "author": "ChirrOp",
   "repository": {
     "type": "git",
-    "url": "https://github.com/chirrop/chirrop-mcp"
+    "url": "git+https://github.com/chirrop/chirrop-mcp.git"
   }
 }

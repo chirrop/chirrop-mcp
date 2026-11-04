@@ -26,6 +26,16 @@ describe("formatError", () => {
     );
   });
 
+  it("prefers the HTTP status over numbers in the message", () => {
+    const err = Object.assign(new Error("threshold 401 exceeded"), { response: { status: 500 } });
+    expect(formatError("create policy", err)).toBe("Failed to create policy: threshold 401 exceeded");
+    expect(formatError("get event", Object.assign(new Error("boom"), { status: 404 }))).toContain("not found");
+  });
+
+  it("only matches status codes as whole words in messages", () => {
+    expect(formatError("send logs", new Error("value 4013 rejected"))).toBe("Failed to send logs: value 4013 rejected");
+  });
+
   it("falls through to generic message for other errors", () => {
     const result = formatError("create policy", new Error("timeout"));
     expect(result).toBe("Failed to create policy: timeout");

@@ -19,22 +19,22 @@ export function formatError(action: string, error: unknown, hint?: string): stri
   if (error instanceof Error) {
     const msg = error.message;
     const status = statusOf(error);
-    if (
-      status === 401 ||
-      status === 403 ||
-      msg.includes("401") ||
-      msg.includes("403") ||
-      msg.includes("Unauthorized")
-    ) {
+    // Prefer the HTTP status; only fall back to the message when there is none,
+    // matching codes as whole words so e.g. "value 4013" isn't read as a 401.
+    const is = (code: number, ...phrases: string[]) =>
+      status !== undefined
+        ? status === code
+        : new RegExp(`\\b${code}\\b`).test(msg) || phrases.some((p) => msg.includes(p));
+    if (is(401, "Unauthorized") || is(403, "Forbidden")) {
       return `Authentication failed while trying to ${action}. Check that CHIRROP_API_KEY is valid.`;
     }
-    if (status === 404 || msg.includes("404") || msg.includes("Not Found")) {
+    if (is(404, "Not Found")) {
       return `Resource not found while trying to ${action}. ${hint ?? "Verify the ID exists."}`;
     }
-    if (status === 429 || msg.includes("429")) {
+    if (is(429, "Too Many Requests")) {
       return `Rate limited while trying to ${action}. Wait and retry.`;
     }
-    if (status === 400 || msg.includes("Bad Request")) {
+    if (is(400, "Bad Request")) {
       return `Invalid request while trying to ${action}: ${msg}`;
     }
     return `Failed to ${action}: ${msg}`;

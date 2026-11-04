@@ -3,7 +3,7 @@ import { Client, EventLogPoint, AnalyticsWindowData } from "@chirropjs/chirrop";
 import { z } from "zod";
 import { formatError } from "../errors.js";
 import { eventRefFields, resolveEventId, resolveEventRefs } from "../refs.js";
-import { computeBucketStats, computeGlobalStats, computeTrend, classifyPctChange, type ChangeSignal } from "../stats.js";
+import { analyzeBuckets, computeBucketStats, computeTrend, classifyPctChange, type ChangeSignal } from "../stats.js";
 
 const EVENT_NOT_FOUND_HINT = "Call list_events to see valid event IDs.";
 
@@ -56,25 +56,17 @@ function interpretAnalytics(data: AnalyticsWindowData | null): {
 }
 
 function detectAnomalyBuckets(points: EventLogPoint[], thresholdSigma: number) {
-  const bucketMeans = points.map((p) =>
-    computeBucketStats(p.count, p.value, p.squares).mean
-  );
-
-  const globalStats = computeGlobalStats(bucketMeans);
+  const { bucketMeans, globalStats, deviationSigma } = analyzeBuckets(points);
 
   const anomalies = points
     .map((p, i) => {
-      const bucketStats = computeBucketStats(p.count, p.value, p.squares);
-      const deviationSigma =
-        globalStats.stddev > 0
-          ? Math.abs(bucketStats.mean - globalStats.mean) / globalStats.stddev
-          : 0;
-      if (deviationSigma <= thresholdSigma) return null;
+      const sigma = deviationSigma(i);
+      if (sigma <= thresholdSigma) return null;
       return {
         occurred_at: p.occurred_at,
-        mean: bucketStats.mean,
-        deviation_sigma: deviationSigma,
-        direction: bucketStats.mean > globalStats.mean ? ("spike" as const) : ("drop" as const),
+        mean: bucketMeans[i]!,
+        deviation_sigma: sigma,
+        direction: bucketMeans[i]! > globalStats.mean ? ("spike" as const) : ("drop" as const),
         count: p.count,
         value: p.value,
         min: p.min,
@@ -223,7 +215,7 @@ export function registerAnalyticsTools(server: McpServer, client: Client): void 
           "Events to compare: each entry is an event UUID or an exact event name. " +
           "Names that exist under multiple agents must be passed as UUIDs. Minimum 2, maximum 10."
         ),
-      period: z.enum(["minute", "hour", "day"]).optional().describe("Rollup bucket granularity, applied to all streams."),
+      period: z.enum(["minute", "hour", "day"]).optional().describe("Rollup bucket granularity, applied to all streams. Defaults to 'hour'."),
       limit: z.number().int().positive().optional().describe("Number of recent buckets per stream. Defaults to 100."),
     },
     annotations: {
@@ -232,7 +224,7 @@ export function registerAnalyticsTools(server: McpServer, client: Client): void 
       destructiveHint: false,
       idempotentHint: true,
     },
-  }, async ({ event_ids, period, limit }) => {
+  }, async ({ event_ids, period = "hour", limit }) => {
     try {
       const resolvedIds = await resolveEventRefs(client, event_ids);
       const allRollups = await Promise.all(
@@ -240,17 +232,8 @@ export function registerAnalyticsTools(server: McpServer, client: Client): void 
       );
 
       const streams = (allRollups as unknown as EventLogPoint[][]).map((rollups, i) => {
-        const bucketMeans = rollups.map((p) =>
-          computeBucketStats(p.count, p.value, p.squares).mean
-        );
-        const globalStats = computeGlobalStats(bucketMeans);
-
-        const anomalyCount = rollups.filter((p) => {
-          const stats = computeBucketStats(p.count, p.value, p.squares);
-          return globalStats.stddev > 0
-            ? Math.abs(stats.mean - globalStats.mean) / globalStats.stddev > 2.0
-            : false;
-        }).length;
+        const { bucketMeans, globalStats, deviationSigma } = analyzeBuckets(rollups);
+        const anomalyCount = rollups.filter((_, j) => deviationSigma(j) > 2.0).length;
 
         const lastPoint = rollups.at(-1);
         const lastMean = bucketMeans.at(-1) ?? 0;
@@ -276,7 +259,7 @@ export function registerAnalyticsTools(server: McpServer, client: Client): void 
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify({ period: period ?? "hour", streams, retrieved_at: new Date().toISOString() }),
+          text: JSON.stringify({ period, streams, retrieved_at: new Date().toISOString() }),
         }],
       };
     } catch (error) {

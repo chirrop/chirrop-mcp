@@ -68,7 +68,7 @@ export function registerPolicyTools(server: McpServer, client: Client): void {
       ...eventRefFields,
       title: z.string().describe("Human-readable policy title, e.g. 'High error rate'."),
       description: z.string().optional().describe("Longer description of what this policy catches."),
-      channel: z.string().describe("Policy routing namespace, e.g. 'ops'. Used by destinations with scope='policies' to filter which alerts they receive."),
+      channel: z.string().describe("Policy routing namespace, e.g. 'ops'. To route a policy's alerts to a specific destination, list its policy_id on a destination with scope='policies'."),
       period: z.enum(["minute", "hour", "day"]).describe("Evaluation period. The aggregate is computed over each period bucket."),
       aggregate: z
         .enum(["sum", "count", "average", "min", "max", "p95_est", "p99_est"])
@@ -117,7 +117,7 @@ export function registerPolicyTools(server: McpServer, client: Client): void {
     annotations: {
       title: "Update Policy",
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: true,
     },
   }, async ({ policy_id, ...payload }) => {

@@ -172,7 +172,7 @@ export function registerAlertTools(server: McpServer, client: Client): void {
     annotations: {
       title: "Archive Alert",
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: true,
     },
   }, async ({ alert_id }) => {

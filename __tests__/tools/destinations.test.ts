@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Client } from "@chirropjs/chirrop";
 import { registerDestinationTools } from "../../src/tools/destinations.js";
@@ -79,6 +79,102 @@ describe("registerDestinationTools", () => {
       await handlers.get("create_destination")!(payload);
 
       expect(client.createDestination).toHaveBeenCalledWith(payload);
+    });
+  });
+
+  describe("env: secret references", () => {
+    afterEach(() => {
+      delete process.env.CHIRROP_SECRET_SLACK_URL;
+      delete process.env.SOME_OTHER_SECRET;
+    });
+
+    it("resolves CHIRROP_SECRET_-prefixed variables", async () => {
+      process.env.CHIRROP_SECRET_SLACK_URL = "https://hooks.slack.com/services/T/B/x";
+
+      await handlers.get("create_destination")!({
+        channel: "slack",
+        url: "env:CHIRROP_SECRET_SLACK_URL",
+        scope: "all",
+        policy_ids: [],
+        enabled: true,
+      });
+
+      expect(client.createDestination).toHaveBeenCalledWith(
+        expect.objectContaining({ url: "https://hooks.slack.com/services/T/B/x" })
+      );
+    });
+
+    it("refuses variables without the prefix, including the API key", async () => {
+      process.env.SOME_OTHER_SECRET = "s3cret";
+
+      for (const name of ["CHIRROP_API_KEY", "SOME_OTHER_SECRET"]) {
+        const result = await handlers.get("create_destination")!({
+          channel: "webhook",
+          url: "https://example.com/hook",
+          credentials: { token: `env:${name}` },
+          scope: "all",
+          policy_ids: [],
+          enabled: true,
+        }) as { content: Array<{ text: string }>; isError: boolean };
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain("CHIRROP_SECRET_");
+      }
+      expect(client.createDestination).not.toHaveBeenCalled();
+    });
+
+    it("rejects unprefixed references in update_destination", async () => {
+      const result = await handlers.get("update_destination")!({
+        destination_id: "d1",
+        url: "env:CHIRROP_API_KEY",
+      }) as { isError: boolean };
+
+      expect(result.isError).toBe(true);
+      expect(client.updateDestination).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("redaction", () => {
+    const stored = {
+      destination_id: "d1",
+      channel: "telegram",
+      url: "https://hooks.slack.com/services/T/B/x",
+      credentials: { bot_token: "123:abc", chat_id: "42", address: "ops@example.com" },
+      scope: "all",
+      enabled: true,
+    };
+    const redacted = {
+      ...stored,
+      url: "https://hooks.slack.com/[redacted]",
+      credentials: { bot_token: "[redacted]", chat_id: "42", address: "ops@example.com" },
+    };
+
+    it("redacts URL paths and secret credentials in every destination response", async () => {
+      client.listDestinations.mockResolvedValue([stored]);
+      client.getDestination.mockResolvedValue(stored);
+      client.createDestination.mockResolvedValue(stored);
+      client.updateDestination.mockResolvedValue(stored);
+
+      const responses = [
+        await handlers.get("list_destinations")!({}),
+        await handlers.get("get_destination")!({ destination_id: "d1" }),
+        await handlers.get("create_destination")!({ channel: "telegram", scope: "all", policy_ids: [], enabled: true }),
+        await handlers.get("update_destination")!({ destination_id: "d1", enabled: true }),
+      ] as Array<{ content: Array<{ text: string }> }>;
+
+      expect(JSON.parse(responses[0]!.content[0]!.text)).toEqual([redacted]);
+      for (const r of responses.slice(1)) {
+        expect(JSON.parse(r.content[0]!.text)).toEqual(redacted);
+        expect(r.content[0]!.text).not.toContain("123:abc");
+      }
+    });
+
+    it("leaves a bare-origin URL readable", async () => {
+      client.getDestination.mockResolvedValue({ ...stored, url: "https://example.com" });
+
+      const result = await handlers.get("get_destination")!({ destination_id: "d1" }) as { content: Array<{ text: string }> };
+
+      expect(JSON.parse(result.content[0]!.text).url).toBe("https://example.com");
     });
   });
 
